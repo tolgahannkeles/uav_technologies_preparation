@@ -17,8 +17,17 @@ menu "nRF24 Transceiver (E01-ML01DP5)"
             (it is in the repository): change it for any real use.
             The key is stored in sdkconfig, which is not committed to git.
 
+    config APP_FREQ_HOP
+        bool "Frequency hopping"
+        default y
+        help
+            Send every message on the next channel of a 16-channel hop
+            table (HOP_TABLE in main.c). Both boards must have the same
+            setting. When off, the fixed channel below is used.
+
     config NRF_CHANNEL
-        int "RF channel (frequency = 2400 + channel MHz)"
+        int "RF channel when hopping is off (frequency = 2400 + channel MHz)"
+        depends on !APP_FREQ_HOP
         range 0 125
         default 76
         help

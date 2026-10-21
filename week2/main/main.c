@@ -6,6 +6,8 @@
  * Type a command in the serial monitor and press Enter: it is encrypted
  * (AES-128-CCM, see components/link_crypto), sent to the other board,
  * decrypted and printed there. Both boards need the same key.
+ * Every message goes out on the next channel of a hop table (see
+ * components/freq_hop).
  *
  * The program is split into two FreeRTOS tasks:
  *
@@ -29,6 +31,7 @@
 #include "sdkconfig.h"
 #include "nrf24.h"
 #include "link_crypto.h"
+#include "freq_hop.h"
 
 /* Values chosen in menuconfig (main/Kconfig.projbuild) */
 #define NODE_ID       CONFIG_APP_NODE_ID
@@ -50,6 +53,17 @@
 #define CMD_MAX_LEN   (NRF24_MAX_PAYLOAD - LINK_CRYPTO_OVERHEAD)
 
 static const char *TAG = "trx";
+
+/* Hop table: both boards must have the same list in the same order.
+ * 16 channels spread over 2402..2480 MHz (channel n = 2400 + n MHz), in a
+ * mixed order so that consecutive messages land far apart in frequency. */
+#if CONFIG_APP_FREQ_HOP
+static const uint8_t HOP_TABLE[] = {
+    2, 41, 17, 66, 29, 74, 9, 53, 35, 80, 22, 60, 13, 47, 70, 26,
+};
+#else
+static const uint8_t HOP_TABLE[] = { CONFIG_NRF_CHANNEL };   /* fixed channel */
+#endif
 
 /* One command typed by the user (+1 for the '\0' terminator) */
 typedef struct {
@@ -124,7 +138,7 @@ static void nrf_task(void *arg)
         .pin_csn = CONFIG_NRF_PIN_CSN,
         .pin_ce = CONFIG_NRF_PIN_CE,
         .pin_irq = CONFIG_NRF_PIN_IRQ,
-        .channel = CONFIG_NRF_CHANNEL,
+        .channel = HOP_TABLE[0],
         .data_rate = DATA_RATE,
         .pa_level = CONFIG_NRF_PA_LEVEL,
         .own_addr = {'N', 'O', 'D', 'E', '0' + NODE_ID},
@@ -141,6 +155,9 @@ static void nrf_task(void *arg)
         vTaskDelete(NULL);
     }
 
+    /* Both boards start on the first channel of the hop table */
+    freq_hop_init(HOP_TABLE, sizeof(HOP_TABLE));
+
     /* The radio stays in receive mode except while it is sending */
     nrf24_start_listening();
     ESP_LOGI(TAG, "node %d ready. Type a command (max %d chars) and press Enter.",
@@ -156,23 +173,31 @@ static void nrf_task(void *arg)
             size_t pkt_len = link_crypto_seal((const uint8_t *)cmd.text, cmd.len, pkt);
             print_hex("[AIR]", pkt, pkt_len);
 
-            /* nrf24_send() switches to TX mode, sends the packet and waits
-             * for the other board's ACK (retrying up to 15 times) */
-            esp_err_t err = nrf24_send(pkt, pkt_len, NULL);
-            nrf24_start_listening();    /* back to RX after sending */
+            /* Send on the current hop channel and wait for the other
+             * board's ACK; if it does not answer there, freq_hop tries the
+             * other channels. Afterwards the radio is listening again, on
+             * the next channel of the table. */
+            uint8_t ch = 0;
+            esp_err_t err = freq_hop_send(pkt, pkt_len, &ch);
             /* OK      : the other board received it
              * no ACK  : packet was sent, but nobody answered
              * timeout : the radio never finished sending (check CE wiring) */
-            printf("[TX] %s -> %s\n", cmd.text,
-                   err == ESP_OK ? "OK" : err == ESP_FAIL ? "no ACK" : "timeout");
+            if (err == ESP_OK) {
+                printf("[TX] %s -> OK (ch %u)\n", cmd.text, ch);
+            } else {
+                printf("[TX] %s -> %s\n", cmd.text, err == ESP_FAIL ? "no ACK" : "timeout");
+            }
         }
 
         /* 2) Packet received? The module pulls its IRQ pin low when a
          *    packet arrives; read until its receive FIFO is empty. */
         if (nrf24_irq_pending()) {
+            uint8_t ch = freq_hop_channel();    /* channel they arrived on */
+            bool got_packet = false;
             uint8_t pkt[NRF24_MAX_PAYLOAD];
             uint8_t n;
             while ((n = nrf24_read(pkt, NULL)) > 0) {
+                got_packet = true;
                 printf("\n");
                 print_hex("[AIR]", pkt, n);
 
@@ -182,7 +207,7 @@ static void nrf_task(void *arg)
                 switch (link_crypto_open(pkt, n, (uint8_t *)text, &len)) {
                 case LINK_CRYPTO_OK:
                     text[len] = '\0';   /* make it a C string for printf */
-                    printf("[RX] %s\n", text);
+                    printf("[RX] %s (ch %u)\n", text, ch);
                     break;
                 case LINK_CRYPTO_ERR_AUTH:
                     printf("[RX] rejected: wrong key or modified packet\n");
@@ -194,6 +219,13 @@ static void nrf_task(void *arg)
                     printf("[RX] rejected: packet too short\n");
                     break;
                 }
+            }
+
+            /* The sender moves to the next channel after our ACK, so we
+             * follow it. This is done even for rejected packets: what
+             * matters for staying in step is that a packet arrived. */
+            if (got_packet) {
+                freq_hop_received();
             }
         }
     }

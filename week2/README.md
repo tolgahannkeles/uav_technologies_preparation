@@ -5,7 +5,8 @@
 komut şifrelenip diğer karta gönderilir, orada çözülüp ekrana yazdırılır.
 
 - Hedef: ESP32, ESP-IDF **v5.3.5**
-- Haberleşme: 2.4 GHz, varsayılan kanal 76 (2476 MHz), 250 kbps
+- Haberleşme: 2.4 GHz, 250 kbps
+- Kanal atlama: her mesaj 16 kanallık tablodaki bir sonraki kanaldan gider (2402–2480 MHz)
 - Şifreleme: **AES-128-CCM** (şifreleme + doğrulama + tekrar saldırısı koruması)
 - Komut başına en fazla **20 karakter**
 - Otomatik onay (ACK): gönderen taraf mesajın karşıya ulaşıp ulaşmadığını öğrenir
@@ -55,7 +56,8 @@ Aynı kodu iki karta yükleyin, **tek fark Node ID**:
 |---|---|---|
 | Node ID | 0 | Bir kart 0, diğeri 1 olmalı |
 | AES-128 key | `000102…0e0f` | 32 hex karakter. İki kartta **aynı** olmalı. Varsayılan anahtar herkese açık, değiştirin |
-| RF channel | 76 | Frekans = 2400 + kanal MHz. İki kartta aynı olmalı. ISM bandında kalmak için ≤ 83 |
+| Frequency hopping | açık | İki kartta aynı olmalı. Kapatılırsa aşağıdaki sabit kanal kullanılır |
+| RF channel | 76 | Sadece kanal atlama kapalıyken. Frekans = 2400 + kanal MHz. ISM bandında kalmak için ≤ 83 |
 | Air data rate | 250 kbps | Düşük hız = daha uzun menzil |
 | PA level | 3 | 0..3. Masada yan yana test ederken 0 kullanın |
 | Pins | yukarıdaki tablo | |
@@ -65,12 +67,16 @@ Aynı kodu iki karta yükleyin, **tek fark Node ID**:
 Monitörde bir komut yazıp Enter'a basın:
 
 ```
-I (312) nrf24: ready: ch 76 (2476 MHz), 250 kbps, PA level 3
+I (312) nrf24: ready: ch 2 (2402 MHz), 250 kbps, PA level 3
 I (318) link_crypto: AES-128-CCM ready, TX counter starts at 0x00010001
+I (318) freq_hop: hopping on, 16 channel(s), starting on ch 2
 I (318) trx: node 0 ready. Type a command (max 20 chars) and press Enter.
 takeoff
 [AIR] 00 01 00 01 5c 1e 9a 47 d2 08 b3 61 f0 2c 7e 99 a4 3d 18
-[TX] takeoff -> OK
+[TX] takeoff -> OK (ch 2)
+land
+[AIR] 00 01 00 02 8e 70 c4 1b 3a f5 27 d9 0c 61 b8 42
+[TX] land -> OK (ch 41)
 ```
 
 `[AIR]` satırı havaya giden paketin kendisidir: ilk 4 bayt sayaç, sonra şifreli komut,
@@ -80,7 +86,10 @@ Diğer kartın monitöründe:
 
 ```
 [AIR] 00 01 00 01 5c 1e 9a 47 d2 08 b3 61 f0 2c 7e 99 a4 3d 18
-[RX] takeoff
+[RX] takeoff (ch 2)
+
+[AIR] 00 01 00 02 8e 70 c4 1b 3a f5 27 d9 0c 61 b8 42
+[RX] land (ch 41)
 ```
 
 `no ACK` görürseniz mesaj karşıya ulaşmamıştır (karşı kart kapalı, kanal farklı,
@@ -98,15 +107,27 @@ nrf_transceiver/
     │   ├── include/nrf24.h     sürücünün API'si
     │   ├── nrf24.c             SPI, CE/IRQ, mod geçişleri, gönderme/alma
     │   └── nrf24_regs.h        yazmaç adresleri ve bit tanımları
-    └── link_crypto/        paket şifreleme (AES-128-CCM, mbedTLS)
-        ├── include/link_crypto.h
-        └── link_crypto.c
+    ├── link_crypto/        paket şifreleme (AES-128-CCM, mbedTLS)
+    │   ├── include/link_crypto.h
+    │   └── link_crypto.c
+    └── freq_hop/           kanal atlama (nrf24'ün üstünde)
+        ├── include/freq_hop.h
+        └── freq_hop.c
 ```
 
 ## Nasıl çalışıyor?
 
 ```
- klavye ──► uart_task ──(kuyruk)──► nrf_task ──► şifrele ──SPI──► nRF24 ~~~ 2.4 GHz ~~~ nRF24 ──► çöz ──► ekran
+ klavye ──► uart_task ──(kuyruk)──► nrf_task ──► şifrele ──► kanal seç ──► nRF24 ~~~ 2.4 GHz ~~~ nRF24 ──► çöz ──► ekran
+```
+
+Katmanlar:
+
+```
+main          ne gönderilecek, ne yazdırılacak
+link_crypto   paketi şifrele / doğrula       (radyodan habersiz)
+freq_hop      hangi kanaldan gönderilecek    (içerikten habersiz)
+nrf24         32 baytı karşıya ulaştır       (donanım)
 ```
 
 - **uart_task**: konsoldan karakterleri okur, Enter'a basılınca satırı bir kuyruğa (queue) koyar.
@@ -138,6 +159,36 @@ ve sürücü bunlara göre yazıldı:
 1. **LNA, CE pinine bağlıdır.** CE = 1 iken alıcı yükselteci açıktır. Bu yüzden gönderim
    sırasında CE, sadece 10 µs değil, ACK gelene kadar yüksek tutulur.
 2. **Yazmaçlar CE = 0 iken yazılmalıdır.**
+
+## Kanal atlama (freq_hop)
+
+Tek bir kanalda kalan bir link, o kanaldaki parazitten (WiFi, başka bir nRF24, kasıtlı karıştırma)
+tamamen etkilenir. Kanal atlamada mesajlar farklı frekanslara dağıtılır; bir kanal bozuksa
+sadece o kanala düşen mesajlar etkilenir.
+
+İki kartta da aynı **atlama tablosu** var (`main.c` → `HOP_TABLE`):
+
+```
+2, 41, 17, 66, 29, 74, 9, 53, 35, 80, 22, 60, 13, 47, 70, 26
+```
+
+- İki kart da tablonun ilk kanalında başlar.
+- Her başarılı mesajdan sonra **iki taraf da bir sonraki kanala geçer**: gönderen ACK'yi
+  alınca, alıcı paketi okuyunca. Böylece ortak bir saate gerek kalmaz.
+- Taraflar senkronu kaybederse (bir kart resetlendi, bir ACK kayboldu, iki kart aynı anda
+  gönderdi) gönderen önce kısa bir rastgele süre bekler, sonra mesajı tablodaki diğer kanallarda
+  dener. Karşı tarafı bulduğu kanaldan iki taraf birlikte devam eder:
+
+```
+I (5120) freq_hop: no answer on ch 66, searching the other channels...
+I (5190) freq_hop: peer found on ch 29, back in sync
+[TX] hover -> OK (ch 29)
+```
+
+Bu **mesaj bazlı** basit bir atlama yöntemi. Gerçek RC/telemetri linklerinde (FrSky, ExpressLRS,
+Bluetooth) kanal, sabit zaman aralıklarıyla değiştirilir ve iki taraf ortak bir zaman çizelgesine
+göre senkron tutulur. Atlama dizisi de genellikle eşleştirme (binding) sırasında paylaşılan bir
+sırdan türetilir; burada anlaşılır olsun diye sabit bir tablo kullanıldı.
 
 ## Şifreleme (link_crypto)
 
@@ -172,7 +223,8 @@ Sınırlamalar (ders örneği olduğu için bilerek basit tutuldu):
 | Belirti | Olası sebep |
 |---|---|
 | `module not responding on SPI` | Kablolama (MISO/MOSI ters, CSN yanlış), modüle 3.3 V gelmiyor |
-| Hep `no ACK` | Karşı kart kapalı, iki kartın Node ID'si aynı, kanal / hız farklı |
+| Hep `no ACK` | Karşı kart kapalı, iki kartın Node ID'si aynı, kanal / hız / kanal atlama ayarı farklı |
+| Sık sık `searching the other channels...` | Normal değil: tablodaki bazı kanallarda parazit var ya da iki kartın `HOP_TABLE`'ı farklı |
 | `[TX] ... -> OK` ama karşıda `rejected: wrong key or modified packet` | İki kartın AES anahtarı farklı |
 | Yan yanayken çalışmıyor, uzakta çalışıyor | Alıcı doyuma gidiyor: PA level'ı 0 yapın |
 | Ara ara reset / paket kaybı | Besleme yetersiz: kondansatör ekleyin, kısa kablo kullanın |
