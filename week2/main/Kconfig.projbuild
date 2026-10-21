@@ -1,0 +1,64 @@
+menu "nRF24 Transceiver (E01-ML01DP5)"
+
+    config APP_NODE_ID
+        int "Node ID (0 or 1)"
+        range 0 1
+        default 0
+        help
+            Flash one board with 0 and the other with 1. Node N listens on
+            address "NODEN" and sends to the other node.
+
+    config NRF_CHANNEL
+        int "RF channel (frequency = 2400 + channel MHz)"
+        range 0 125
+        default 76
+        help
+            Both nodes must use the same channel. Keep it <= 83 to stay
+            inside the 2400-2483.5 MHz ISM band.
+
+    choice NRF_DATA_RATE
+        prompt "Air data rate"
+        default NRF_DR_250KBPS
+        help
+            250 kbps gives the best sensitivity (-96 dBm) and the 2.5 km
+            range quoted in the E01-ML01DP5 manual.
+
+        config NRF_DR_250KBPS
+            bool "250 kbps"
+        config NRF_DR_1MBPS
+            bool "1 Mbps"
+        config NRF_DR_2MBPS
+            bool "2 Mbps"
+    endchoice
+
+    config NRF_PA_LEVEL
+        int "PA level (0=-18, 1=-12, 2=-6, 3=0 dBm at chip; +~20 dB from module PA)"
+        range 0 3
+        default 3
+        help
+            3 gives ~20 dBm (100 mW) at the SMA connector. Use 0 on the
+            bench when the two modules are close to each other, otherwise
+            the receiver can be overloaded.
+
+    menu "Pins"
+        config NRF_PIN_SCK
+            int "SCK"
+            default 18
+        config NRF_PIN_MOSI
+            int "MOSI"
+            default 23
+        config NRF_PIN_MISO
+            int "MISO"
+            default 19
+        config NRF_PIN_CSN
+            int "CSN"
+            default 5
+        config NRF_PIN_CE
+            int "CE"
+            default 22
+        config NRF_PIN_IRQ
+            int "IRQ"
+            default 21
+    endmenu
+
+endmenu
