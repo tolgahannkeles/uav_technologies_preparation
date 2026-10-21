@@ -8,6 +8,15 @@ menu "nRF24 Transceiver (E01-ML01DP5)"
             Flash one board with 0 and the other with 1. Node N listens on
             address "NODEN" and sends to the other node.
 
+    config APP_CRYPTO_KEY
+        string "AES-128 key (32 hex characters)"
+        default "000102030405060708090a0b0c0d0e0f"
+        help
+            Shared key used to encrypt and authenticate every packet.
+            Both boards must use the same key. The default key is public
+            (it is in the repository): change it for any real use.
+            The key is stored in sdkconfig, which is not committed to git.
+
     config NRF_CHANNEL
         int "RF channel (frequency = 2400 + channel MHz)"
         range 0 125

@@ -3,8 +3,9 @@
  *
  * Flash the same firmware on two boards, one with Node ID 0 and the other
  * with Node ID 1 (idf.py menuconfig -> "nRF24 Transceiver").
- * Type a command in the serial monitor and press Enter: it is sent to the
- * other board, which prints it.
+ * Type a command in the serial monitor and press Enter: it is encrypted
+ * (AES-128-CCM, see components/link_crypto), sent to the other board,
+ * decrypted and printed there. Both boards need the same key.
  *
  * The program is split into two FreeRTOS tasks:
  *
@@ -24,8 +25,10 @@
 #include "freertos/queue.h"
 #include "driver/uart.h"
 #include "esp_log.h"
+#include "nvs_flash.h"
 #include "sdkconfig.h"
 #include "nrf24.h"
+#include "link_crypto.h"
 
 /* Values chosen in menuconfig (main/Kconfig.projbuild) */
 #define NODE_ID       CONFIG_APP_NODE_ID
@@ -42,14 +45,27 @@
 
 #define CMD_QUEUE_LEN 8     /* how many commands can wait to be sent */
 
+/* An nRF24 packet carries at most 32 bytes. Encryption adds a 4-byte
+ * counter and an 8-byte tag, which leaves 20 bytes for the command. */
+#define CMD_MAX_LEN   (NRF24_MAX_PAYLOAD - LINK_CRYPTO_OVERHEAD)
+
 static const char *TAG = "trx";
 
-/* One command typed by the user. An nRF24 packet carries at most 32 bytes,
- * so a command is limited to 32 characters (+1 for the '\0' terminator). */
+/* One command typed by the user (+1 for the '\0' terminator) */
 typedef struct {
-    char text[NRF24_MAX_PAYLOAD + 1];
+    char text[CMD_MAX_LEN + 1];
     uint8_t len;
 } command_t;
+
+/* Print a packet as hex, so we can see what actually goes over the air */
+static void print_hex(const char *label, const uint8_t *data, size_t len)
+{
+    printf("%s", label);
+    for (size_t i = 0; i < len; i++) {
+        printf(" %02x", data[i]);
+    }
+    printf("\n");
+}
 
 /* uart_task puts commands here, nrf_task takes them out */
 static QueueHandle_t s_cmd_queue;
@@ -82,7 +98,7 @@ static void uart_task(void *arg)
                 }
                 cmd.len = 0;
             }
-        } else if (cmd.len < NRF24_MAX_PAYLOAD && c >= ' ') {
+        } else if (cmd.len < CMD_MAX_LEN && c >= ' ') {
             /* Printable character: store it and echo it back, otherwise
              * the user would not see what they type */
             cmd.text[cmd.len++] = (char)c;
@@ -119,19 +135,30 @@ static void nrf_task(void *arg)
         vTaskDelete(NULL);      /* nothing to do without a radio */
     }
 
+    /* Shared AES key from menuconfig; both boards must use the same one */
+    if (link_crypto_init(CONFIG_APP_CRYPTO_KEY, NODE_ID, PEER_ID) != ESP_OK) {
+        ESP_LOGE(TAG, "crypto init failed");
+        vTaskDelete(NULL);
+    }
+
     /* The radio stays in receive mode except while it is sending */
     nrf24_start_listening();
     ESP_LOGI(TAG, "node %d ready. Type a command (max %d chars) and press Enter.",
-             NODE_ID, NRF24_MAX_PAYLOAD);
+             NODE_ID, CMD_MAX_LEN);
 
     for (;;) {
         /* 1) Command waiting to be sent? Wait at most 10 ms for one, so we
          *    also get to check for incoming packets regularly. */
         command_t cmd;
         if (xQueueReceive(s_cmd_queue, &cmd, pdMS_TO_TICKS(10)) == pdTRUE) {
+            /* Encrypt: [counter][ciphertext][tag] */
+            uint8_t pkt[NRF24_MAX_PAYLOAD];
+            size_t pkt_len = link_crypto_seal((const uint8_t *)cmd.text, cmd.len, pkt);
+            print_hex("[AIR]", pkt, pkt_len);
+
             /* nrf24_send() switches to TX mode, sends the packet and waits
              * for the other board's ACK (retrying up to 15 times) */
-            esp_err_t err = nrf24_send(cmd.text, cmd.len, NULL);
+            esp_err_t err = nrf24_send(pkt, pkt_len, NULL);
             nrf24_start_listening();    /* back to RX after sending */
             /* OK      : the other board received it
              * no ACK  : packet was sent, but nobody answered
@@ -143,11 +170,30 @@ static void nrf_task(void *arg)
         /* 2) Packet received? The module pulls its IRQ pin low when a
          *    packet arrives; read until its receive FIFO is empty. */
         if (nrf24_irq_pending()) {
-            uint8_t buf[NRF24_MAX_PAYLOAD + 1];
+            uint8_t pkt[NRF24_MAX_PAYLOAD];
             uint8_t n;
-            while ((n = nrf24_read(buf, NULL)) > 0) {
-                buf[n] = '\0';          /* make it a C string for printf */
-                printf("\n[RX] %s\n", (char *)buf);
+            while ((n = nrf24_read(pkt, NULL)) > 0) {
+                printf("\n");
+                print_hex("[AIR]", pkt, n);
+
+                /* Decrypt and check the tag and the counter */
+                char text[NRF24_MAX_PAYLOAD + 1];
+                size_t len;
+                switch (link_crypto_open(pkt, n, (uint8_t *)text, &len)) {
+                case LINK_CRYPTO_OK:
+                    text[len] = '\0';   /* make it a C string for printf */
+                    printf("[RX] %s\n", text);
+                    break;
+                case LINK_CRYPTO_ERR_AUTH:
+                    printf("[RX] rejected: wrong key or modified packet\n");
+                    break;
+                case LINK_CRYPTO_ERR_REPLAY:
+                    printf("[RX] rejected: replayed packet\n");
+                    break;
+                case LINK_CRYPTO_ERR_SHORT:
+                    printf("[RX] rejected: packet too short\n");
+                    break;
+                }
             }
         }
     }
@@ -155,6 +201,14 @@ static void nrf_task(void *arg)
 
 void app_main(void)
 {
+    /* NVS (flash key-value store) keeps the crypto boot counter */
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        err = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(err);
+
     /* The queue must exist before either task starts using it */
     s_cmd_queue = xQueueCreate(CMD_QUEUE_LEN, sizeof(command_t));
 
